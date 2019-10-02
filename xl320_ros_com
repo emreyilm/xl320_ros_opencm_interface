@@ -1,0 +1,369 @@
+
+/*******************************************************************************
+* XL320 JointStatePublisher
+* 
+* Copyright (c) 2018 EMRE YILMAZ. All rights reserved.
+* emreyilm@sabanciuniv.edu
+* 
+* Do not forget to set buffer size as 1024 for OpenCM in ros.h !!
+* Publish rate should be limited to 10Hz for a stable communication !!
+*******************************************************************************/
+#include <ros.h>
+#include <time.h>
+#include <std_msgs/String.h>
+#include <std_msgs/Float32.h>
+#include <std_msgs/UInt8MultiArray.h>
+#include <rosserial_msgs/RequestParam.h>
+#include <trajectory_msgs/JointTrajectoryPoint.h>
+#include <sensor_msgs/JointState.h>
+
+#include <DynamixelSDK.h>
+
+//Define XL320 Settings
+// Control table address for XL320
+#define ADDR_XL320_Model_Number        0 //2byte
+#define ADDR_XL320_Firmware_Version    2 //1byte
+#define ADDR_XL320_Id                  3 //1byte
+#define ADDR_XL320_Baudrate            4 //1byte
+#define ADDR_XL320_Return_Delay_Time   5 //1byte
+#define ADDR_XL320_CW_Angle_Limit      6 //2byte
+#define ADDR_XL320_CCW_Angle_Limit     8 //2byte
+#define ADDR_XL320_Control_Mode        11 //1byte
+#define ADDR_XL320_Temperature_Limit   12 //1byte
+#define ADDR_XL320_Min_Voltage_Limit   13 //1byte
+#define ADDR_XL320_Max_Voltage_Limit   14 //1byte
+#define ADDR_XL320_Max_Torque          15 //2byte
+#define ADDR_XL320_Status_Return_Level 17 //1byte
+#define ADDR_XL320_Shutdown            18 //1byte
+#define ADDR_XL320_Torque_Enable       24 //1byte
+#define ADDR_XL320_Led                 25 //1byte
+#define ADDR_XL320_D_Gain              27 //1byte
+#define ADDR_XL320_I_Gain              28 //1byte
+#define ADDR_XL320_P_Gain              29 //1byte
+#define ADDR_XL320_Goal_Position       30 //2byte
+#define ADDR_XL320_Moving_Speed        32 //2byte
+#define ADDR_XL320_Torque_Limit        34 //2byte
+#define ADDR_XL320_Present_Position    37 //2byte
+#define ADDR_XL320_Present_Speed       39 //2byte
+#define ADDR_XL320_Present_Load        41 //2byte
+#define ADDR_XL320_Present_Voltage     45 //1byte
+#define ADDR_XL320_Present_Temperature 46 //1byte
+#define ADDR_XL320_Registered          47 //1byte
+#define ADDR_XL320_Moving              49 //1byte
+#define ADDR_XL320_Hardware_Error_Status   50 //1byte
+#define ADDR_XL320_Punch                   51 //2byte
+
+#define XL320_PROTOCOL_VERSION         2.0          //XL320 uses Protocol 2.0
+
+#define XL320_ID                       1            //Default ID is 1
+#define XL320_BAUDRATE                 1000000      //Default Baudrate is 1Mbps
+#define XL320_PORT                     "1"          // Check which port is being used on OpenCM9.04
+                                                    // 1: Serial1(XL320), 2: Serial2(UART2), 3: Serial3(485 EXP)
+#define DXL_XL320_MIN_POSITION         0            // Dynamixel will rotate between this value
+#define DXL_XL320_MAX_POSITION         1023
+
+//Common Values
+#define TORQUE_ENABLE                  1            // Value for enabling the torque
+#define TORQUE_DISABLE                 0            // Value for disabling the torque
+#define DXL_MOVING_STATUS_THRESHOLD    20           // Dynamixel moving status threshold
+
+#define ESC_ASCII_VALUE                0x1b
+
+
+#define N_SERVOS 3
+
+ros::NodeHandle nh;
+
+sensor_msgs::JointState jointstates_msg;
+ros::Publisher pub_jointstates("joint_states", &jointstates_msg);
+std_msgs::String string_msg;
+ros::Publisher pub_string("string", &string_msg);
+
+long next_frame_time             = 0;
+long msgs_seq                    = 1;
+int idx                          = 0;
+int xl320_comm_result            = COMM_TX_FAIL; 
+uint8_t xl320_error              = 0;  
+int16_t xl320_present_position   = 0;
+int16_t xl320_present_speed      = 0;
+
+int open_port_success            = 0;
+int set_baudrate_success        = 0;
+
+dynamixel::PortHandler   *xl320_portHandler ;
+dynamixel::PacketHandler *xl320_packetHandler;
+
+void write(dynamixel::PortHandler *portHandler, dynamixel::PacketHandler *packetHandler, uint8_t id, uint16_t addr, uint16_t length, uint32_t value)
+{
+  if (length == 1)  {
+    xl320_comm_result     = packetHandler->write1ByteTxRx(portHandler, id, addr, (uint8_t)value, &xl320_error);
+  }
+  else if (length == 2)  {
+    xl320_comm_result     = packetHandler->write2ByteTxRx(portHandler, id, addr, (uint16_t)value, &xl320_error);
+  }
+
+  if (xl320_comm_result != COMM_SUCCESS)  {
+    xl320_packetHandler->getTxRxResult(xl320_comm_result);
+  }
+  else if (xl320_error != 0)  {
+    xl320_packetHandler->getRxPacketError(xl320_error);
+  }
+  else{  
+  }
+}
+
+int8_t read1Byte(dynamixel::PortHandler *portHandler, dynamixel::PacketHandler *packetHandler, uint8_t id, uint16_t addr)
+{
+  int8_t value8 = 0;
+  xl320_comm_result     = packetHandler->read1ByteTxRx(portHandler, id, addr, (uint8_t*)&value8, &xl320_error);
+  return value8;
+  
+  if (xl320_comm_result != COMM_SUCCESS)  {
+    xl320_packetHandler->getTxRxResult(xl320_comm_result);
+  }
+  else if (xl320_error != 0)  {
+    xl320_packetHandler->getRxPacketError(xl320_error);
+  }
+  else  {  
+  }
+}
+
+int16_t read2Bytes(dynamixel::PortHandler *portHandler, dynamixel::PacketHandler *packetHandler, uint8_t id, uint16_t addr)
+{
+  int16_t value16 = 0;
+  xl320_comm_result     = packetHandler->read2ByteTxRx(portHandler, id, addr, (uint16_t*)&value16, &xl320_error);
+  return value16;
+  
+  if (xl320_comm_result != COMM_SUCCESS)  {
+    xl320_packetHandler->getTxRxResult(xl320_comm_result);
+  }
+  else if (xl320_error != 0)  {
+    xl320_packetHandler->getRxPacketError(xl320_error);
+  }
+  else  {  
+  }
+}
+
+void sendPosition(int id, uint16_t pos, uint16_t vel){
+
+   write(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_Goal_Position, 2, (uint32_t)pos);
+   write(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_Moving_Speed,  2, (uint32_t)vel);
+
+}
+
+int32_t readPosition(int id){
+  
+   xl320_present_position = read2Bytes(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_Present_Position);
+   return xl320_present_position;
+}
+
+int32_t readSpeed(int id){
+  
+   xl320_present_speed = read2Bytes(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_Present_Speed);
+   return xl320_present_speed;
+}
+
+
+trajectory_msgs::JointTrajectoryPoint trajpoint;
+
+uint16_t rad2pos(float rad)
+{
+  return (uint16_t) (rad * 195.378608); // deg * 1023 / 300
+}
+
+float pos2rad(uint16_t pos)
+{
+  return ((float) pos) / 195.378608;
+}
+
+uint16_t radpers2vel(float radpers)
+{
+  if (radpers < 0) {
+    return 300; // ~33.3 RPM
+  }
+  return (uint16_t) (radpers * 85.692372); // radps * 1023 / 11.938052   => 114 RPM(11.938052 radps) -> 1023
+}
+
+void command_servo(const uint16_t servo_id, const float angle, const float velocity) {
+  if (angle > 5.23598) { // 300 deg
+    nh.logerror("Invalid angle");
+    return;
+  }
+  if (velocity > 11.938052) { // 114 RPM
+    nh.logerror("Invalid velocity");
+    return;
+  }
+  
+  uint16_t pos = rad2pos(angle);
+
+    if (servo_id == 3){
+    if (pos>306.744414){
+       pos = 306.744414;
+      }
+     if (pos<85.206781){
+      pos = 85.206781;
+     }
+    }
+    
+  uint16_t vel = radpers2vel(velocity);
+  
+  nh.logdebug("Sending command to servo");
+  sendPosition(servo_id, pos, vel);
+
+}
+
+void servo_cb(const uint16_t servo_id, const std_msgs::Float32& cmd_msg) {
+  float angle = cmd_msg.data;
+  command_servo(servo_id, angle, -1);
+}
+
+void trajpoint_cb(const trajectory_msgs::JointTrajectoryPoint& point) {
+  if (point.positions_length != N_SERVOS) {
+    nh.logerror("Wrong number of positions");
+    return;
+  }
+  if (point.velocities_length > 0 && point.velocities_length != point.positions_length) {
+    nh.logerror("Number of velocities (if provided) must match the number of positions");
+    return;
+  }
+  
+  for (int id=1; id<=N_SERVOS; id++) {
+    float angle = point.positions[id-1];
+    float velocity = -1;
+    if (point.velocities_length > 0) {
+      velocity = point.velocities[id-1];
+    }
+    command_servo(id, angle, velocity);
+  }
+}
+
+void getpidparams_cb(const rosserial_msgs::RequestParamRequest& req, rosserial_msgs::RequestParamResponse& res) {
+  uint8_t i = 0;
+  
+  if (res.ints_length < N_SERVOS*3) {
+    res.ints = (int32_t*) realloc(res.ints, N_SERVOS*3*sizeof(int32_t));
+  }
+  res.ints_length = N_SERVOS*3;
+  
+  for (int id=1; id<=N_SERVOS; id++) {
+    res.ints[i++] = (int32_t) read1Byte(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_P_Gain);
+    res.ints[i++] = (int32_t) read1Byte(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_I_Gain);
+    res.ints[i++] = (int32_t) read1Byte(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_D_Gain);
+  }
+}
+
+void setpidparams_cb(const std_msgs::UInt8MultiArray& params) {
+  uint8_t pgain, igain, dgain;
+  uint8_t i = 0;
+  
+  if (params.data_length != N_SERVOS*3) {
+    nh.logerror("Incorrect number of PID parameters (expecting 3 params per servo)");
+    return;
+  }
+  
+  for (int id=1; id<=N_SERVOS; id++) {
+    pgain = (uint8_t) params.data[i++];
+    if (pgain > 1023) { nh.logerror("P gain must be <= 1023"); return; }
+    igain = (uint8_t) params.data[i++];
+    if (pgain > 254) { nh.logerror("I gain must be <= 254"); return; }
+    dgain = (uint8_t) params.data[i++];
+    if (pgain > 254) { nh.logerror("D gain must be <= 254"); return; }
+    write(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_P_Gain, 1, (uint32_t)pgain);
+    write(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_I_Gain, 1, (uint32_t)igain);
+    write(xl320_portHandler,xl320_packetHandler, id, ADDR_XL320_D_Gain, 1, (uint32_t)dgain);   
+   }
+}
+
+void servo1(const std_msgs::Float32& cmd_msg) { servo_cb(1, cmd_msg); }
+void servo2(const std_msgs::Float32& cmd_msg) { servo_cb(2, cmd_msg); }
+void servo3(const std_msgs::Float32& cmd_msg) { servo_cb(3, cmd_msg); }
+
+ros::Subscriber<std_msgs::Float32> sub1("servo1", servo1);
+ros::Subscriber<std_msgs::Float32> sub2("servo2", servo2);
+ros::Subscriber<std_msgs::Float32> sub3("servo3", servo3);
+
+ros::Subscriber<trajectory_msgs::JointTrajectoryPoint> sub_trajpoint("trajpoint", trajpoint_cb);
+
+ros::ServiceServer<rosserial_msgs::RequestParamRequest, rosserial_msgs::RequestParamResponse> srv_pidparams("getpidparams_srv", &getpidparams_cb);
+ros::Subscriber<std_msgs::UInt8MultiArray> sub_pidparams("pidparams", setpidparams_cb);
+
+void setup() {
+  //Serial.begin(57600);
+  //while (!Serial);
+  nh.getHardware()->setBaud(1000000);
+  nh.initNode(); 
+  nh.subscribe(sub1);
+  nh.subscribe(sub2);
+  nh.subscribe(sub3);
+  nh.subscribe(sub_trajpoint);
+  nh.subscribe(sub_pidparams);
+  nh.advertise(pub_jointstates);
+  nh.advertiseService(srv_pidparams);
+  
+  while(!nh.connected()) nh.spinOnce();
+  nh.loginfo("Startup complete");
+  
+  jointstates_msg.name = (char**) malloc(N_SERVOS * sizeof(char*));
+  jointstates_msg.name_length = N_SERVOS;
+  jointstates_msg.name[0] = "servo1";
+  jointstates_msg.name[1] = "servo2";
+  jointstates_msg.name[2] = "servo3";
+  jointstates_msg.position_length = N_SERVOS;
+  jointstates_msg.position = (float*) malloc(N_SERVOS * sizeof(float));
+  jointstates_msg.velocity_length = N_SERVOS;
+  jointstates_msg.velocity = (float*) malloc(N_SERVOS * sizeof(float));
+  
+  xl320_portHandler   = dynamixel::PortHandler::getPortHandler(XL320_PORT);
+  xl320_packetHandler = dynamixel::PacketHandler::getPacketHandler(XL320_PROTOCOL_VERSION);
+
+  open_port_success     = xl320_portHandler->openPort();
+  set_baudrate_success  = xl320_portHandler->setBaudRate(XL320_BAUDRATE);
+
+  write(xl320_portHandler,xl320_packetHandler, 1, ADDR_XL320_Torque_Enable, 1, TORQUE_ENABLE);
+  write(xl320_portHandler,xl320_packetHandler, 2, ADDR_XL320_Torque_Enable, 1, TORQUE_ENABLE);
+  write(xl320_portHandler,xl320_packetHandler, 3, ADDR_XL320_Torque_Enable, 1, TORQUE_ENABLE);
+
+  write(xl320_portHandler,xl320_packetHandler, 1, ADDR_XL320_Led, 1, 6);
+  write(xl320_portHandler,xl320_packetHandler, 2, ADDR_XL320_Led, 1, 1);
+  write(xl320_portHandler,xl320_packetHandler, 3, ADDR_XL320_Led, 1, 2);
+// off(0); red(1); yesil(2); sari(3); koyumavi(4); mor(5); acikmavi(6); beyaz(7)
+  while(1){
+   if (millis() > next_frame_time)
+  {
+    publish_jointstates();
+    next_frame_time = millis() + 100; // 10Hz
+  }
+  nh.spinOnce();
+  delay(1);
+  }
+}
+
+void publish_jointstates()
+{
+  boolean read_error = false;
+  
+  jointstates_msg.header.seq = msgs_seq ++;
+  jointstates_msg.header.stamp = nh.now();
+  
+  for (int id=1; id<=N_SERVOS; id++) {
+    uint16_t pos = readPosition(id);
+    uint16_t vel = readSpeed(id);
+    if (pos == 0xffff) {
+      read_error = true;
+      break;
+    }
+    float rad   = pos2rad(pos);
+    float radps = pos2rad(vel);
+    jointstates_msg.position[id-1] = rad;
+    jointstates_msg.velocity[id-1] = radps;
+  }
+  
+  if (!read_error) {
+    pub_jointstates.publish(&jointstates_msg);
+  }
+}
+
+void loop() {
+
+
+}
